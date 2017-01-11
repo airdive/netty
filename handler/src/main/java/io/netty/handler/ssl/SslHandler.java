@@ -308,7 +308,8 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
     private boolean firedChannelRead;
 
     private volatile long handshakeTimeoutMillis = 10000;
-    private volatile long closeNotifyTimeoutMillis = 3000;
+    private volatile long closeNotifyFlushTimeoutMillis = 3000;
+    private volatile long closeNotifyReadTimeoutMillis;
 
     /**
      * Creates a new instance.
@@ -378,24 +379,73 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
         this.handshakeTimeoutMillis = handshakeTimeoutMillis;
     }
 
+    /**
+     * @deprecated use {@link #getCloseNotifyFlushTimeoutMillis()}
+     */
+    @Deprecated
     public long getCloseNotifyTimeoutMillis() {
-        return closeNotifyTimeoutMillis;
+        return getCloseNotifyFlushTimeoutMillis();
     }
 
+    /**
+     * @deprecated use {@link #setCloseNotifyFlushTimeout(long, TimeUnit)}
+     */
+    @Deprecated
     public void setCloseNotifyTimeout(long closeNotifyTimeout, TimeUnit unit) {
-        if (unit == null) {
-            throw new NullPointerException("unit");
-        }
-
-        setCloseNotifyTimeoutMillis(unit.toMillis(closeNotifyTimeout));
+        setCloseNotifyFlushTimeout(closeNotifyTimeout, unit);
     }
 
-    public void setCloseNotifyTimeoutMillis(long closeNotifyTimeoutMillis) {
-        if (closeNotifyTimeoutMillis < 0) {
+    /**
+     * @deprecated use {@link #setCloseNotifyFlushTimeoutMillis(long)}
+     */
+    @Deprecated
+    public void setCloseNotifyTimeoutMillis(long closeNotifyFlushTimeoutMillis) {
+        setCloseNotifyFlushTimeoutMillis(closeNotifyFlushTimeoutMillis);
+    }
+
+    public long getCloseNotifyFlushTimeoutMillis() {
+        return closeNotifyFlushTimeoutMillis;
+    }
+
+    public void setCloseNotifyFlushTimeout(long closeNotifyFlushTimeoutMillis, TimeUnit unit) {
+        setCloseNotifyFlushTimeoutMillis(unit.toMillis(closeNotifyFlushTimeoutMillis));
+    }
+
+    public void setCloseNotifyFlushTimeoutMillis(long closeNotifyFlushTimeoutMillis) {
+        if (closeNotifyFlushTimeoutMillis < 0) {
             throw new IllegalArgumentException(
-                    "closeNotifyTimeoutMillis: " + closeNotifyTimeoutMillis + " (expected: >= 0)");
+                    "closeNotifyFlushTimeoutMillis: " + closeNotifyFlushTimeoutMillis + " (expected: >= 0)");
         }
-        this.closeNotifyTimeoutMillis = closeNotifyTimeoutMillis;
+        this.closeNotifyFlushTimeoutMillis = closeNotifyFlushTimeoutMillis;
+    }
+
+    /**
+     * Gets the timeout (in ms) for receiving the response for the close_notify that was triggered by closing the
+     * {@link Channel}. This timeout starts after the close_notify message was successfully written to the
+     * remote peer. Use {@code 0} to directly close the {@link Channel} and not wait for the response.
+     */
+    public long getCloseNotifyReadTimeoutMillis() {
+        return closeNotifyReadTimeoutMillis;
+    }
+
+    /**
+     * Sets the timeout  for receiving the response for the close_notify that was triggered by closing the
+     * {@link Channel}. This timeout starts after the close_notify message was successfully written to the
+     * remote peer. Use {@code 0} to directly close the {@link Channel} and not wait for the response.
+     */
+    public void setCloseNotifyReadTimeout(long closeNotifyReadTimeoutMillis, TimeUnit unit) {
+        setCloseNotifyReadTimeoutMillis(unit.toMillis(closeNotifyReadTimeoutMillis));
+    }
+
+    /**
+     * See {@link #setCloseNotifyReadTimeout(long, TimeUnit)}.
+     */
+    public void setCloseNotifyReadTimeoutMillis(long closeNotifyReadTimeoutMillis) {
+        if (closeNotifyReadTimeoutMillis < 0) {
+            throw new IllegalArgumentException(
+                    "closeNotifyReadTimeoutMillis: " + closeNotifyReadTimeoutMillis + " (expected: >= 0)");
+        }
+        this.closeNotifyReadTimeoutMillis = closeNotifyReadTimeoutMillis;
     }
 
     /**
@@ -791,6 +841,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
         // Ensure we always notify the sslClosePromise as well
         notifyClosePromise(CHANNEL_CLOSED);
+
         super.channelInactive(ctx);
     }
 
@@ -1515,7 +1566,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
         final ScheduledFuture<?> timeoutFuture;
         if (!flushFuture.isDone()) {
-            if (closeNotifyTimeoutMillis > 0) {
+            if (closeNotifyFlushTimeoutMillis > 0) {
                 // Force-close the connection if close_notify is not fully sent in time.
                 timeoutFuture = ctx.executor().schedule(new Runnable() {
                     @Override
@@ -1524,7 +1575,7 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
 
                         addCloseListener(ctx.close(ctx.newPromise()), promise);
                     }
-                }, closeNotifyTimeoutMillis, TimeUnit.MILLISECONDS);
+                }, closeNotifyFlushTimeoutMillis, TimeUnit.MILLISECONDS);
             } else {
                 timeoutFuture = null;
             }
@@ -1540,9 +1591,43 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
                 if (timeoutFuture != null) {
                     timeoutFuture.cancel(false);
                 }
-                // Trigger the close in all cases to make sure the promise is notified
-                // See https://github.com/netty/netty/issues/2358
-                addCloseListener(ctx.close(ctx.newPromise()), promise);
+                final long closeNotifyReadTimeout = closeNotifyReadTimeoutMillis;
+                if (closeNotifyReadTimeout <= 0) {
+                    // Trigger the close in all cases to make sure the promise is notified
+                    // See https://github.com/netty/netty/issues/2358
+                    addCloseListener(ctx.close(ctx.newPromise()), promise);
+                } else {
+                    final ScheduledFuture<?> closeNotifyReadTimeoutFuture;
+
+                    if (!sslClosePromise.isDone()) {
+                        closeNotifyReadTimeoutFuture = ctx.executor().schedule(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (!sslClosePromise.isDone()) {
+                                    logger.warn("{} Not received close_notify response in the configured timeout" +
+                                            " of {}ms; force-closing the connection.",
+                                            ctx.channel(), closeNotifyReadTimeout);
+
+                                    // Do the close now...
+                                    addCloseListener(ctx.close(ctx.newPromise()), promise);
+                                }
+                            }
+                        }, closeNotifyReadTimeout, TimeUnit.MILLISECONDS);
+                    } else {
+                        closeNotifyReadTimeoutFuture = null;
+                    }
+
+                    // Do the close once the we received the close_notify.
+                    sslClosePromise.addListener(new FutureListener<Channel>() {
+                        @Override
+                        public void operationComplete(Future<Channel> future) throws Exception {
+                            if (closeNotifyReadTimeoutFuture != null) {
+                                closeNotifyReadTimeoutFuture.cancel(false);
+                            }
+                            addCloseListener(ctx.close(ctx.newPromise()), promise);
+                        }
+                    });
+                }
             }
         });
     }
